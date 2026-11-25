@@ -1,0 +1,215 @@
+import 'package:flutter/material.dart';
+import 'package:geocoding/geocoding.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:get/get.dart';
+import 'package:image_cropper/image_cropper.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:get_storage/get_storage.dart';
+
+import '../../../core/constants/app_colors.dart';
+import '../../../core/utils/app_snackbar.dart';
+import '../../../data/repositories/supabase_auth_repository.dart';
+import '../../../routes/app_routes.dart';
+
+class ProfileSetupController extends GetxController {
+  final formKey = GlobalKey<FormState>();
+
+  final nameController = TextEditingController();
+  final phoneController = TextEditingController();
+  final cityController = TextEditingController();
+
+  final isLoading = false.obs;
+  final photoPath = RxnString();
+  final locationGranted = false.obs;
+  final isLocating = false.obs;
+
+  final occupation = 'student'.obs;
+
+  final ImagePicker _picker = ImagePicker();
+
+  @override
+  void onInit() {
+    super.onInit();
+    _importFromAuth();
+  }
+
+  void _importFromAuth() {
+    final args = Get.arguments;
+    if (args is Map) {
+      final name = args['name']?.toString().trim() ?? '';
+      final phone = args['phone']?.toString().trim() ?? '';
+      if (name.isNotEmpty) nameController.text = name;
+      if (phone.isNotEmpty) phoneController.text = phone;
+    }
+  }
+
+  void selectOccupation(String value) => occupation.value = value;
+
+  Future<void> pickPhoto() async {
+    try {
+      final file = await _picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 90,
+      );
+      if (file == null) return;
+
+      final cropped = await ImageCropper().cropImage(
+        sourcePath: file.path,
+        aspectRatio: const CropAspectRatio(ratioX: 1, ratioY: 1),
+        uiSettings: [
+          AndroidUiSettings(
+            toolbarTitle: 'Crop photo',
+            toolbarColor: AppColors.primary,
+            toolbarWidgetColor: Colors.white,
+            activeControlsWidgetColor: AppColors.accent,
+            initAspectRatio: CropAspectRatioPreset.square,
+            lockAspectRatio: true,
+            statusBarColor: AppColors.primaryDark,
+            backgroundColor: AppColors.primaryDeep,
+          ),
+          IOSUiSettings(
+            title: 'Crop photo',
+            aspectRatioLockEnabled: true,
+            resetAspectRatioEnabled: false,
+            aspectRatioPickerButtonHidden: true,
+            doneButtonTitle: 'Done',
+            cancelButtonTitle: 'Cancel',
+          ),
+        ],
+        compressFormat: ImageCompressFormat.jpg,
+        compressQuality: 88,
+      );
+
+      if (cropped != null) {
+        photoPath.value = cropped.path;
+      }
+    } catch (_) {
+      AppSnackbar.error('Photo', 'Could not pick or crop image.');
+    }
+  }
+
+  Future<void> requestLocation() async {
+    isLocating.value = true;
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        AppSnackbar.warning('Location', 'Please turn on location services.');
+        isLocating.value = false;
+        return;
+      }
+
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+
+      if (permission == LocationPermission.denied) {
+        AppSnackbar.warning('Location', 'Location permission denied.');
+        locationGranted.value = false;
+        isLocating.value = false;
+        return;
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        AppSnackbar.error(
+          'Location',
+          'Permission permanently denied. Open settings to enable.',
+        );
+        await openAppSettings();
+        locationGranted.value = false;
+        isLocating.value = false;
+        return;
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+        ),
+      );
+
+      locationGranted.value = true;
+
+      try {
+        final geocoding = Geocoding();
+        final placemarks = await geocoding.placemarkFromCoordinates(
+          position.latitude,
+          position.longitude,
+        );
+        if (placemarks.isNotEmpty) {
+          final p = placemarks.first;
+          final city = (p.locality != null && p.locality!.isNotEmpty)
+              ? p.locality!
+              : (p.subAdministrativeArea != null &&
+                    p.subAdministrativeArea!.isNotEmpty)
+              ? p.subAdministrativeArea!
+              : (p.administrativeArea ?? '');
+          if (city.isNotEmpty) {
+            cityController.text = city;
+          }
+        }
+      } catch (_) {
+        // User can type city manually
+      }
+      AppSnackbar.success(
+        'Location enabled',
+        cityController.text.isNotEmpty
+            ? 'City set to ${cityController.text}'
+            : 'Location found. Please confirm your city.',
+      );
+    } catch (_) {
+      AppSnackbar.error('Location', 'Could not get your location.');
+      locationGranted.value = false;
+    } finally {
+      isLocating.value = false;
+    }
+  }
+
+  Future<void> continueNext() async {
+    if (!formKey.currentState!.validate()) return;
+
+    if (cityController.text.trim().isEmpty) {
+      AppSnackbar.warning('City', 'Please confirm your city.');
+      return;
+    }
+
+    isLoading.value = true;
+    try {
+      final name = nameController.text.trim();
+      final phone = phoneController.text.trim();
+      final city = cityController.text.trim();
+      await Get.find<SupabaseAuthRepository>().updateProfile(
+        name: name,
+        phone: phone,
+        city: city,
+        occupation: occupation.value,
+      );
+
+      final box = GetStorage();
+      await box.write('profile_name', name);
+      await box.write('profile_phone', phone);
+      await box.write('profile_city', city);
+      await box.write('profile_occupation', occupation.value);
+      if (photoPath.value != null) {
+        await box.write('profile_photo', photoPath.value);
+      }
+
+      AppSnackbar.success('Profile saved', 'Welcome, $name!');
+      Get.offNamed(AppRoutes.roleSelection);
+    } on Exception catch (error) {
+      AppSnackbar.error('Profile not saved', error.toString());
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  void goBack() => Get.back();
+
+  @override
+  void onClose() {
+    nameController.dispose();
+    phoneController.dispose();
+    cityController.dispose();
+    super.onClose();
+  }
+}
